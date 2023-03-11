@@ -254,6 +254,26 @@ void dict_print(unsigned char *key, void *val, be_type type, FILE* fp)
 	}
 }
 
+void dict_print_to_str(unsigned char *key, void *val, be_type type, char* str)
+{
+	char tmp_file[] = "/tmp/dict_print_to_str_XXXXXX";
+	FILE *fp = fopen(tmp_file, "w+");
+	if(fp==NULL) return;
+	dict_print(key, val, type, fp);
+	fclose(fp);
+	fp = fopen(tmp_file, "r");
+	if(fp==NULL) return;
+	// Get the length of the file
+	fseek(fp, 0, SEEK_END);
+	size_t len = ftell(fp);
+	fseek(fp, 0, SEEK_SET);
+	// Read the file into the string
+	fread(str, 1, len, fp);
+	str[len] = '\0';
+	fclose(fp);
+	remove(tmp_file);
+}
+
 be_dict*
 decode_file(const char *file)
 {

@@ -134,6 +134,15 @@ void dict_val_print (unsigned char *key, void *val, be_type type);
 void dict_print (unsigned char *key, void *val, be_type type, FILE *file);
 
 /**
+ * Prints a bencoded dictionary to a string
+ * @param key The key of the value to be printed
+ * @param val The value to be printed
+ * @param type The type of the value to be printed
+ * @param str The string to which the value is to be printed
+ */
+void dict_print_to_str (unsigned char *key, void *val, be_type type, char *str);
+
+/**
  * Prints the values in a dictionary to stdout
  * @param dict The dictionary to be dumped
  */

@@ -1,7 +1,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <math.h>
 
 #include <unistd.h>
 
@@ -17,6 +16,8 @@
 
 #include "bencode.h"
 #include "p2p.h"
+#include <miniupnpc/miniupnpc.h>
+#include <miniupnpc/upnpcommands.h>
 
 static int
 write_data(void* content, int size, int nmemb, be_string* response)
@@ -59,6 +60,35 @@ close_peer_socks(int* sockets, int size)
 	}
 }
 
+static void
+cleanup(peer_status* stats,
+		int conn_peers,
+		piece* cl_pcs,
+		int num_pcs,
+		int* sockets,
+		int total_peers,
+		FILE* fp)
+{
+	for (int i = 0; i < conn_peers; i++) {
+		DESTROY(stats[i].bitfield);
+		DESTROY(stats[i].mssg);
+	}
+	for (int i = 0; i < num_pcs; i++) {
+		DESTROY(cl_pcs[i].blocks);
+		DESTROY(cl_pcs[i].data);
+	}
+	close_peer_socks(sockets, total_peers);
+	fclose(fp);
+}
+
+static int
+err_is_ignorable()
+{
+	printf("Error: %s\n", strerror(errno));
+	return errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR;
+		// || errno == 0 || errno == EINPROGRESS;
+}
+
 static int
 send_all(int sockfd, unsigned char* buff, int* len)
 {
@@ -80,6 +110,217 @@ send_all(int sockfd, unsigned char* buff, int* len)
 	return n;
 }
 
+// chndhsk = client handshake
+// phndhsk = peer handshake
+// clen = length of client handshake
+// plen = length of peer handshake
+static int
+valid_hndshk(unsigned char* chndhsk, unsigned char* phndhsk, int plen)
+{
+	int clen = 1 + PSTRLEN + 8 + SHA_DIGEST_LENGTH + PEERID_LEN;
+	if (plen != clen) {
+		printf("Handshake lengths don't match\n");
+		return 0;
+	}
+	int hash_i = 1 + PSTRLEN + 8; // index where info hash begins
+	// check if info hash is same in both handshakes
+	// Print out the hashes for debugging
+	printf("Client hash: ");
+	for (int i = 0; i < SHA_DIGEST_LENGTH; i++) {
+		printf("%02x", chndhsk[hash_i + i]);
+	}
+	printf("\nPeer hash: ");
+	for (int i = 0; i < SHA_DIGEST_LENGTH; i++) {
+		printf("%02x", phndhsk[hash_i + i]);
+	}
+	printf("\n");
+	return memcmp(&chndhsk[hash_i], &phndhsk[hash_i], SHA_DIGEST_LENGTH) == 0;
+}
+
+// Endianness is accounted for by the shifts. No need for htonl or family
+static int
+get_mssg_len(unsigned char* mssg, int buff_len)
+{
+	if (buff_len < 4) {
+		return -1;
+	}
+	uint32_t mssg_len =
+	  (mssg[0] << 24) + (mssg[1] << 16) + (mssg[2] << 8) + mssg[3];
+	return mssg_len;
+}
+
+static int
+int_from_bytes(unsigned char* mssg)
+{
+	return get_mssg_len(mssg, 4);
+}
+
+// Endianness is accounted for by the shifts. No need for htonl or family
+static void
+int_to_bytes(unsigned char* bytes, int n)
+{
+	bytes[0] = (n >> 24) & 0xFF;
+	bytes[1] = (n >> 16) & 0xFF;
+	bytes[2] = (n >> 8) & 0xFF;
+	bytes[3] = n & 0xFF;
+}
+
+static int
+has_piece(unsigned char* bitfield, int index)
+{
+	if (index < 0) {
+		return 0;
+	}
+	int byte_index = index / 8;
+	int offset = index % 8;
+	return ((bitfield[byte_index] >> (7 - offset)) & 1) != 0;
+}
+
+static void
+set_piece(unsigned char* bitfield, int index)
+{
+	int byte_index = index / 8;
+	int offset = index % 8;
+	bitfield[byte_index] |= 1 << (7 - offset);
+}
+
+static int
+mssg_received(peer_status status)
+{
+	return ((status.mssg_len == status.recv_mssg_len) &&
+			(status.mssg_len != 0));
+}
+
+static void
+reset_peer_step(peer_status* status)
+{
+	status->mssg_len = 0;
+	status->recv_mssg_len = 0;
+	status->curr_step = STEP_READMSG;
+}
+
+static void
+clear_dwnlds(piece* pc, int num_blcks)
+{
+	for (int i = 0; i < num_blcks; i++) {
+		if (pc->blocks[i].status == DOWNLOADING) {
+			pc->blocks[i].status = NONE;
+		}
+	}
+}
+
+static int
+pc_completed(block* curr_blocks, int num_blcks)
+{
+	for (int i = 0; i < num_blcks; i++) {
+		if (curr_blocks[i].status != DOWNLOADED) {
+			return 0;
+		}
+	}
+	return 1;
+}
+
+static int
+hash_matched(piece pc)
+{
+	unsigned char hash[SHA_DIGEST_LENGTH];
+	SHA1(pc.data, pc.length, hash);
+	return memcmp(hash, pc.valid_hash, SHA_DIGEST_LENGTH) == 0;
+}
+
+static int
+chck_pc_complete(piece* cl_pcs,
+				 int* pc_idx,
+				 int* pcs_dwnlded,
+				 int num_blcks,
+				 int num_pcs,
+				 int left_peers,
+				 FILE* fp)
+{
+	if (*pc_idx < 0) {
+		return 0;
+	}
+	if (cl_pcs[*pc_idx].status == DOWNLOADED) {
+		*pc_idx = -1;
+		return 0;
+	}
+	if (pc_completed(cl_pcs[*pc_idx].blocks, num_blcks)) {
+		long long int piece_len = cl_pcs[0].length;
+		int res = hash_matched(cl_pcs[*pc_idx]);
+		// res == 1 (hash check successful)
+		if (res) {
+			int idx = *pc_idx;
+			piece pc = cl_pcs[idx];
+			if (fseek(fp, idx * piece_len, SEEK_SET) < 0) {
+				printf("[E] fseek() failed: %s. Aborting download\n",
+					   strerror(errno));
+				DESTROY(cl_pcs[*pc_idx].data);
+				return -1;
+			}
+			if (fwrite(pc.data, 1, pc.length, fp) != pc.length) {
+				printf("[E] fwrite() failed: %s. Aborting download\n",
+					   strerror(errno));
+				DESTROY(cl_pcs[*pc_idx].data);
+				return -1;
+			}
+			cl_pcs[*pc_idx].status = DOWNLOADED;
+			++(*pcs_dwnlded);
+			float percentage = (((float)*pcs_dwnlded) / num_pcs) * 100;
+			printf("[>] (%0.2f%%) Downloaded piece #%d from %d peers\n",
+				   percentage,
+				   idx,
+				   left_peers);
+			DESTROY(cl_pcs[*pc_idx].data);
+			*pc_idx = -1;
+			return 1;
+		} else {
+			clear_dwnlds(&cl_pcs[*pc_idx], num_blcks);
+			cl_pcs[*pc_idx].status = NONE;
+			return -2;
+		}
+	}
+	// piece not yet complete
+	return 0;
+}
+
+static size_t
+write_ip(void* ptr, size_t size, size_t nmemb, void* data)
+{
+	if (size * nmemb < 16) {
+		memcpy(data, ptr, size * nmemb);
+		((char*)data)[size * nmemb] = '\0';
+	}
+	return size * nmemb;
+}
+
+// Curl whatismyip.akamai.com to get the external IP address
+static int
+get_external_ip(char* ip)
+{
+	CURL* curl = curl_easy_init();
+	if (!curl) {
+		return 1;
+	}
+	curl_easy_setopt(curl, CURLOPT_URL, "http://whatismyip.akamai.com");
+	curl_easy_setopt(curl, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_1_0);
+	curl_easy_setopt(curl, CURLOPT_HTTPGET, 1L);
+
+	curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_ip);
+	curl_easy_setopt(curl, CURLOPT_WRITEDATA, ip);
+	
+	int i = 0;
+	int err;
+	while ((err = curl_easy_perform(curl)) != 0) {
+		if (i++ > MAX_RETRY) {
+			printf("[E] curl_easy_perform() failed: %s\n",
+				   curl_easy_strerror(err));
+			return 1;
+		}
+	}
+	curl_easy_cleanup(curl);
+	return 0;
+}
+
 int generate_torrent(const char *file, const char *name, const char *output)
 {
     FILE *fp = fopen(file, "rb");
@@ -96,8 +337,8 @@ int generate_torrent(const char *file, const char *name, const char *output)
     be_string *node;
 
     // Add announce URL
-	char *announce_url = "udp://tracker.opentrackr.org:1337/announce";
-    node = str_create((unsigned char*)"udp://tracker.opentrackr.org:1337/announce", strlen(announce_url));
+	unsigned char *announce_url = "https://tracker.nanoha.org:443/announce";
+    node = str_create((unsigned char*)"https://tracker.nanoha.org:443/announce", strlen(announce_url));
     dict_set(dict, (unsigned char*)"announce", node, BE_STR);
 
     // Add creation date
@@ -114,20 +355,15 @@ int generate_torrent(const char *file, const char *name, const char *output)
     dict_set(info, (unsigned char*)"piece length", (void*)PIECELEN, BE_INT);
 
     // Add pieces
-    unsigned char *pieces = malloc((int)ceil((double)size / PIECELEN) * SHA_DIGEST_LENGTH);
+    unsigned char *pieces = malloc(size / PIECELEN * SHA_DIGEST_LENGTH);
     unsigned char *piece = malloc(PIECELEN);
     unsigned char *hash = malloc(SHA_DIGEST_LENGTH);
-    int length = PIECELEN;
-	for(size_t i = 0; i < ((double)size / PIECELEN); i++) {
+    for(size_t i = 0; i < size / PIECELEN; i++) {
         fread(piece, 1, PIECELEN, fp);
-		// Check if we are at the end of the file
-		if(i == (size_t)ceil((double)size / PIECELEN) - 1) {
-			length = size % PIECELEN == 0 ? PIECELEN : size % PIECELEN;
-		}
-		SHA1(piece, length, hash);
-		memcpy(pieces + i * SHA_DIGEST_LENGTH, hash, SHA_DIGEST_LENGTH);
+        SHA1(piece, PIECELEN, hash);
+        memcpy(pieces + i * SHA_DIGEST_LENGTH, hash, SHA_DIGEST_LENGTH);
     }
-    node = str_create(pieces, (int)ceil((double)size / PIECELEN) * SHA_DIGEST_LENGTH);
+    node = str_create(pieces, size / PIECELEN * SHA_DIGEST_LENGTH);
     dict_set(info, (unsigned char*)"pieces", node, BE_STR);
 
     // Add length
@@ -150,13 +386,13 @@ int generate_torrent(const char *file, const char *name, const char *output)
     free(piece);
     free(hash);
     fclose(fp);
+    dict_destroy(dict);
 
     return 0;
 }
 
-int
-p2p_start(const char* file, const char* name)
-{
+int seed(int port, int verbose, char* file_name, char* torrent_file) {
+	// ------------------------- INITIALIZATION -------------------------
 	char query[BUFFLEN + 1];
 	void* val;
 	be_type type;
@@ -170,15 +406,15 @@ p2p_start(const char* file, const char* name)
 	long long int length;
 	long long int piece_len;
 	int num_pcs;
+	int pcs_dwnlded = 0;
 
-	int conn_socks[HANDLECOUNT] = { -1 };
-
-	// peer id
+	int conn_socks[HANDLECOUNT];
+	memset(conn_socks, -1, sizeof(conn_socks));
 	// -------
 	char* peer_id = generate_peer_id();
 
 	be_string* string;
-	be_dict* dict = decode_file(file);
+	be_dict* dict = decode_file(torrent_file);
 	if (dict == NULL) {
 		printf("Could not read or Found syntax error in torrent file\n");
 		DESTROY(peer_id);
@@ -247,18 +483,8 @@ p2p_start(const char* file, const char* name)
 
 	// name
 	// ----
-	if (name == NULL) {
-		val = dict_get(info, (unsigned char*)"name", &type);
-		if (val == NULL || type != BE_STR) {
-			printf("No name found\n");
-			DICT_DESTROY(dict);
-			DESTROY(peer_id);
-			return 1;
-		}
-		string = (be_string*)val;
-		name = (char*)string->str;
-	}
-	fp = fopen(name, "w+");
+
+	fp = fopen(file_name, "r");
 	if (fp == NULL) {
 		printf("Could not open file: %s\n", strerror(errno));
 		DICT_DESTROY(dict);
@@ -268,6 +494,8 @@ p2p_start(const char* file, const char* name)
 
 	// -----------------------------------------------------------------------
 	num_pcs = length / piece_len + (length % piece_len != 0);
+	int cl_bitf_len = num_pcs / 8 + (num_pcs % 8 != 0);
+	int num_blcks = piece_len / BLOCKLEN + (piece_len % BLOCKLEN != 0);
 	// -----------------------------------------------------------------------
 
 	// pieces
@@ -288,16 +516,103 @@ p2p_start(const char* file, const char* name)
 		return 1;
 	}
 
+	// Get listen socket
+	int listen_sock = socket(AF_INET, SOCK_STREAM, 0);
+	if (listen_sock < 0) {
+		switch (errno) {
+			case EPROTONOSUPPORT: {
+				printf("Protocol not supported\n");
+				break;
+			}
+			case EACCES: {
+				printf("Permisson to create socket denied\n");
+				break;
+			}
+			default: {
+				printf("Error creating socket: %s\n", strerror(errno));
+				break;
+			}
+		}
+		fclose(fp);
+		return 1;
+	}
+	struct sockaddr_in serv_addr;
+	serv_addr.sin_family = AF_INET;
+	serv_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+	serv_addr.sin_port = htons(port);
+	if (bind(listen_sock, (struct sockaddr*)&serv_addr, sizeof(serv_addr)) <
+		0) {
+		printf("Could not bind to port %d\n", port);
+		return 1;
+	}
+	if (listen(listen_sock, 5) < 0) {
+		printf("Could not listen on socket\n");
+		return 1;
+	}
+
+	char ip[16];
+
+	// UPnP port forwarding
+	int error = 0;
+	struct UPNPDev* devlist = upnpDiscover(2000, NULL, NULL, 0, 0, 2, &error);
+	if (devlist == NULL) {
+		printf("UPnP device not found\n");
+	} else {
+		struct UPNPUrls urls;
+		struct IGDdatas data;
+		int status = UPNP_GetValidIGD(devlist, &urls, &data, ip, sizeof(ip));
+		if (status == 1) {
+			char port_str[6];
+			snprintf(port_str, 6, "%d", port);
+			int r = UPNP_AddPortMapping(urls.controlURL,
+										data.first.servicetype,
+										port_str,
+										port_str,
+										ip,
+										"BitTorrent",
+										"TCP",
+										NULL,
+										"0");
+			if (r != UPNPCOMMAND_SUCCESS) {
+				printf("UPnP port forwarding failed\n");
+			} else {
+				printf("UPnP port forwarding successful\n");
+			}
+			freeUPNPDevlist(devlist);
+			FreeUPNPUrls(&urls);
+		} else {
+			printf("UPnP device not found\n");
+		}
+	}
+
+	// Get local IP address
+	get_external_ip(ip);
+	printf("Local IP: %s\n", ip);
+
 	printf("Tracker found: %s\n", annurl);
+
+	// snprintf(query,
+	// 		 BUFFLEN + 1,
+	// 		 "%s?info_hash=%s&peer_id=%s&port=%d&uploaded=0&downloaded=%lld"
+	// 		 "ip=%s&left=0&compact=1",
+	// 		 annurl,
+	// 		 info_hash,
+	// 		 peer_id,
+	// 		 port,
+	// 		 length,
+	// 		 ip);
 
 	snprintf(query,
 			 BUFFLEN + 1,
-			 "%s?info_hash=%s&peer_id=%s&port=6889&uploaded=0&downloaded=0&"
-			 "left=%lld&compact=1",
+			 "%s?info_hash=%s&peer_id=%s&port=%d&uploaded=0&downloaded=%lld"
+			 "&left=0&compact=1",
 			 annurl,
 			 info_hash,
 			 peer_id,
+			 port,
 			 length);
+
+	printf("Query: %s\n", query);
 
 	// ------------------------------ HANDSHAKE ------------------------------
 	// 1 byte for length of protocol identifier
@@ -314,6 +629,22 @@ p2p_start(const char* file, const char* name)
 	memcpy(&hndshk[1 + PSTRLEN + 8], dict->info_hash, SHA_DIGEST_LENGTH);
 	memcpy(&hndshk[1 + PSTRLEN + 8 + SHA_DIGEST_LENGTH], peer_id, PEERID_LEN);
 
+	// ------------------------------ EXTENDED HANDSHAKE ---------------------
+	// 1 byte for message ID
+	// A be_dict containing the following:
+	// 		m: be_dict containing the following:
+	// 			ut_metadata: 3
+	// 		upload_only: 1
+	be_dict* ext_hndshk = dict_create();
+	be_dict* m = dict_create();
+	dict_set(m, (unsigned char*)"ut_metadata", (void*)3, BE_INT);
+	dict_set(ext_hndshk, (unsigned char*)"m", (void*)m, BE_DICT);
+	dict_set(ext_hndshk, (unsigned char*)"upload_only", (void*)1, BE_INT);
+	char ext_hndshk_str[1024];
+	dict_print_to_str(NULL, ext_hndshk, BE_DICT, ext_hndshk_str);
+	int ext_hndshk_len = strlen(ext_hndshk_str);
+	printf("Extended handshake: %s\n", ext_hndshk_str);
+
 	// Destroy dictionary after everything related
 	// to this dictionary is done
 	DICT_DESTROY(dict);
@@ -327,8 +658,12 @@ p2p_start(const char* file, const char* name)
 	curl = curl_easy_init();
 	if (curl != NULL) {
 		curl_easy_setopt(curl, CURLOPT_URL, query);
-		curl_easy_setopt(curl, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_1_0);
-		curl_easy_setopt(curl, CURLOPT_HTTPGET, 1L);
+		curl_easy_setopt(curl, CURLOPT_VERBOSE, verbose);
+		// curl_easy_setopt(curl, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_1_0);
+		// curl_easy_setopt(curl, CURLOPT_HTTPGET, 1L);
+		curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1);
+		curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 8);
+		curl_easy_setopt(curl, CURLOPT_IPRESOLVE, CURL_IPRESOLVE_V4);
 
 		curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, &write_data);
 		curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
@@ -375,7 +710,6 @@ p2p_start(const char* file, const char* name)
 		printf("\n");
 		DICT_DESTROY(dict);
 		DESTROY(orig_resp);
-
 		fclose(fp);
 		return 1;
 	}
@@ -398,7 +732,7 @@ p2p_start(const char* file, const char* name)
 	int total_peers = string->len / 6; // Number of peers
 	printf("Peers found: %d\n", total_peers);
 
-	peer peers[total_peers];
+	peer peers[HANDLECOUNT];
 	int i = total_peers;
 
 	while (i) {
@@ -420,10 +754,29 @@ p2p_start(const char* file, const char* name)
 		// 1AE1, which is the port number
 		peers[total_peers - i].port = (peers_str[4] << 8) | peers_str[5];
 		peers_str = peers_str + 6;
+		printf("Peer %d: %s:%d\n",
+			   total_peers - i,
+			   peers[total_peers - i].ip,
+			   peers[total_peers - i].port);
 		--i;
 	}
 	DICT_DESTROY(dict);
 	DESTROY(orig_resp);
+	
+	// Remove ourselves from the list of peers
+	for (i = 0; i < total_peers; i++) {
+		printf("%s %s %d %d\n", peers[i].ip, ip, peers[i].port, port);
+		if ((strcmp(peers[i].ip, "127.0.0.1") == 0 || strcmp(peers[i].ip, ip) == 0)
+			&& peers[i].port == port) {
+			printf("Removing ourselves from the list of peers\n");
+			while (i < total_peers - 1) {
+				peers[i] = peers[i + 1];
+				++i;
+			}
+			--total_peers;
+			break;
+		}
+	}
 
 	int sockets[total_peers]; // sockets for all peers returned by tracker
 	int fdmax = 0;
@@ -474,11 +827,11 @@ p2p_start(const char* file, const char* name)
 
 		int res = connect(sockets[i], (struct sockaddr*)&addr, sizeof(addr));
 		if (res == 0) {
-			printf("Connected to peer %s\n", peers[i].ip);
+			printf("Connected to peer %s:%d\n", peers[i].ip, peers[i].port);
 			continue;
 		} else if (res < 0 && errno != EINPROGRESS) {
-			printf("Error while connecting to peer %s: %s\n",
-				   peers[i].ip,
+			printf("Error while connecting to peer %s:%d: %s\n",
+				   peers[i].ip, peers[i].port,
 				   strerror(errno));
 			continue;
 		}
@@ -504,7 +857,8 @@ p2p_start(const char* file, const char* name)
 		ready_fds = conn_master;
 		int res = select(fdmax + 1, NULL, &ready_fds, NULL, &tv);
 		if (res == -1) {
-			printf("[E] Error on select() (hndshk): %s\n", strerror(errno));
+			verprintf(
+			  verbose, "[E] Error on select() (hndshk): %s\n", strerror(errno));
 			close_peer_socks(sockets, total_peers);
 			fclose(fp);
 			return 1;
@@ -518,7 +872,8 @@ p2p_start(const char* file, const char* name)
 					socklen_t len = sizeof res;
 					getsockopt(curr_sock, SOL_SOCKET, SO_ERROR, &res, &len);
 					if (res == 0) { // Can write
-						printf("[c] Connected to peer %s\n", peers[i].ip);
+						verprintf(
+						  verbose, "[c] Connected to peer %s:%d\n", peers[i].ip, peers[i].port);
 
 						conn_socks[conn_peers] = curr_sock;
 						FD_CLR(curr_sock, &conn_master);
@@ -527,180 +882,1168 @@ p2p_start(const char* file, const char* name)
 
 						res = send_all(curr_sock, hndshk, &hndshk_len);
 						if (res < 0) {
-							printf("[e] Could not send data to peer %s\n",
-									  peers[i].ip);
+							verprintf(verbose,
+									  "[e] Could not send data to peer %s:%d\n",
+									  peers[i].ip, peers[i].port);
 						} else {
-							printf("[h] Sent handshake to peer %s\n",
-									  peers[i].ip);
+							verprintf(verbose,
+									  "[h] Sent handshake to peer %s:%d\n",
+									  peers[i].ip, peers[i].port);
 						}
 					} else { // Error
-						printf("[e] Error on peer %s: %s (whndshk)\n",
-								  peers[i].ip,
+						verprintf(verbose,
+								  "[e] Error on peer %s:%d: %s (whndshk)\n",
+								  peers[i].ip, peers[i].port,
 								  strerror(res));
 						FD_CLR(curr_sock, &conn_master);
 					}
 				}
 			}
 		} else {
-			printf("[!] Timeout for connecting peers\n");
+			verprintf(verbose, "[!] Timeout for connecting peers\n");
 			break;
 		}
 	}
-	if (left_peers == 0) {
-		printf("No peers connected\n");
-		close_peer_socks(sockets, total_peers);
-		fclose(fp);
-		return 1;
+
+	verprintf(verbose, "[!] Connected to %d peers\n", conn_peers);
+
+	peer_status stats[HANDLECOUNT];
+	for (int i = 0; i < HANDLECOUNT; i++) {
+		stats[i].mssg_len = 0;
+		stats[i].recv_mssg_len = 0;
+		stats[i].curr_step = i < conn_peers ? STEP_HANDSHAKE : STEP_NONE;
+		stats[i].choked = 1;
+		stats[i].interested = 0;
+		stats[i].has_pcs = 0;
+		stats[i].recv_intrstd = 0;
+		stats[i].am_choking = 1;
+		stats[i].bitfield = NULL;
+		stats[i].mssg = NULL;
+		stats[i].req = NULL;
+		stats[i].req_len = 0;
+		stats[i].curr_reqs = 0; // Number of ongoing requests
+		stats[i].curr_pc_idx = -1;
+		stats[i].curr_blck_off = -1;
+		if (conn_socks[i] != -1) {
+			struct sockaddr_in addr;
+			socklen_t addrlen = sizeof addr;
+			getpeername(conn_socks[i], (struct sockaddr*)&addr, &addrlen);
+			inet_ntop(AF_INET, &addr.sin_addr, stats[i].ip, INET_ADDRSTRLEN);
+		}
 	}
 
-	printf("[!] Connected to %d peers\n", conn_peers);
-	close_peer_socks(sockets, total_peers);
-	fclose(fp);
+	FD_SET(listen_sock, &comm_master);
+	if (listen_sock > fdmax) {
+		fdmax = listen_sock;
+	}
+	conn_socks[conn_peers++] = listen_sock;
+
+	printf("Seeding \n");
+
+	left_peers = conn_peers;
+	// Ready file desriptors copied from comm_master set every loop
+	fd_set ready_fds;
+	int *leeched = calloc(SIMULBLOCKS, sizeof(int));
+	int leeched_len = 0;
+
+// 	// ------------------------- MAIN LOOP ------------------------------
+	while (1) {
+		int res;
+		struct timeval tv = { .tv_sec = 0, .tv_usec = COMMTIMEOUT };
+		FD_ZERO(&ready_fds);
+		ready_fds = comm_master;
+		res = select(fdmax + 1, &ready_fds, NULL, NULL, &tv);
+		if (res == -1) {
+			verprintf(
+			  verbose, "[E] Error on select() (read): %s\n", strerror(errno));
+			return 1;
+		} else if (res) {
+			for (int i = 0; i < conn_peers; i++) {
+				int curr_sock = conn_socks[i];
+				// printf("curr_sock: %d, ip: %s, port: %d\n", curr_sock, peers[i].ip, peers[i].port);
+				if (curr_sock == -1) {
+					FD_CLR(curr_sock, &comm_master);
+					continue;
+				}
+				
+				if (FD_ISSET(curr_sock, &ready_fds)) {
+					if (curr_sock == listen_sock) {
+						// ------------------------- ACCEPT -------------------------
+						printf("yes curr_sock: %d, ip: %s, port: %d\n", curr_sock, peers[i].ip, peers[i].port);
+					
+						struct sockaddr_in cli_addr;
+						socklen_t cli_len = sizeof(cli_addr);
+						int new_sock = accept(listen_sock, (struct sockaddr*)&cli_addr,
+											&cli_len);
+						char ip[INET_ADDRSTRLEN];
+						unsigned short port = ntohs(cli_addr.sin_port);
+						inet_ntop(AF_INET, &cli_addr.sin_addr, ip, INET_ADDRSTRLEN);
+
+						if (new_sock < 0) {
+							printf("[e] Could not accept connection\n");
+							return -1;
+						}
+						// Check message handshake
+						unsigned char peer_hndshk[hndshk_len];
+						res = recv(
+						new_sock, peer_hndshk, hndshk_len, MSG_NOSIGNAL);
+						if (res <= 0) {
+							if (res == 0) {
+								verprintf(
+								verbose, "[e] Peer %s:%d hung up\n", ip, port);
+							} else {
+								verprintf(
+								verbose,
+								"[e] Error on peer %s:%d: %s (rhndshk)\n",
+								ip, port,
+								strerror(errno));
+							}
+							continue;
+						} else {
+							// res is the length of peer_hndshk that was read
+							// as returned by recv()
+							if (valid_hndshk(hndshk, peer_hndshk, res)) {
+								verprintf(verbose,
+										"[v] Got handshake from peer %s:%d\n",
+										ip, port);
+								// Update peer status
+								int peer_idx = -1;
+								for (int j = 0; j < HANDLECOUNT; j++) {
+									if (conn_socks[j] == -1) {
+										peer_idx = j;
+										break;
+									}
+								}
+								if (peer_idx == -1) {
+									verprintf(verbose, "[e] Could not accept connection from peer %s:%d,"
+											" no free slots\n", ip, port);
+									close(new_sock);
+									continue;
+								}
+								
+								res = send_all(new_sock, hndshk, &hndshk_len);
+								if (res < 0) {
+									verprintf(verbose,
+											"[e] Could not send data to peer %s:%d\n",
+											ip, port);
+									close(new_sock);
+									continue;
+								} else {
+									verprintf(verbose,
+											"[h] Sent handshake to peer %s:%d\n",
+											ip, port);
+									strcpy(stats[peer_idx].ip, ip);
+									strcpy(peers[peer_idx].ip, stats[peer_idx].ip);
+									peers[peer_idx].port = port;
+									conn_socks[peer_idx] = new_sock;
+
+									FD_SET(new_sock, &comm_master);
+									if (new_sock > fdmax) {
+										fdmax = new_sock;
+									}
+									left_peers++; 
+									if (conn_peers <= peer_idx) {
+										conn_peers = peer_idx + 1;
+									}
+									reset_peer_step(&stats[peer_idx]);
+									stats[peer_idx].curr_step = STEP_SNDBTFLD;
+									verprintf(
+										verbose, "[a] Accepted connection from peer %s:%d\n",
+										peers[peer_idx].ip, peers[peer_idx].port);
+									continue;
+								}
+							} else {
+								verprintf(verbose,
+										"[e] BAD handshake from peer %s:%d\n",
+										ip, port);
+								continue;
+							}
+						}
+						
+					// ----------------------------------------------------------
+					}
+					char* curr_ip = stats[i].ip;
+					int curr_pc_idx = stats[i].curr_pc_idx;
+					// ===================== HANDSHAKE =======================
+					if (stats[i].curr_step == STEP_HANDSHAKE) {
+						unsigned char peer_hndshk[hndshk_len];
+						res = recv(
+						curr_sock, peer_hndshk, hndshk_len, MSG_NOSIGNAL);
+						if (res <= 0) {
+							if (res == 0) {
+								verprintf(
+								verbose, "[e] Peer %s:%d hung up\n", curr_ip, peers[i].port);
+							} else {
+								verprintf(
+								verbose,
+								"[e] Error on peer %s:%d: %s (rhndshk)\n",
+								curr_ip, peers[i].port,
+								strerror(errno));
+							}
+							conn_socks[i] = -1;
+							FD_CLR(curr_sock, &comm_master);
+							--left_peers;
+							continue;
+						} else {
+							// res is the length of peer_hndshk that was read
+							// as returned by recv()
+							if (valid_hndshk(hndshk, peer_hndshk, res)) {
+								verprintf(verbose,
+										"[v] Got handshake from peer %s:%d\n",
+										curr_ip, peers[i].port);
+								reset_peer_step(&stats[i]);
+								stats[i].curr_step = STEP_SNDBTFLD;
+								continue;
+							} else {
+								verprintf(verbose,
+										"[e] BAD handshake from peer %s:%d: %s\n",
+										curr_ip, peers[i].port, strerror(errno));
+								FD_CLR(curr_sock, &comm_master);
+								--left_peers;
+								continue;
+							}
+						}
+					}
+
+					// =================== MESSAGE LENGTH ====================
+					if (stats[i].curr_step == STEP_READMSG) {
+						// Tried recv() on peer but got no response
+						if (stats[i].mssg_len > 0 &&
+							stats[i].recv_mssg_len == 0) {
+							verprintf(
+							verbose,
+							"[e] Peer %s:%d not responding. Disconnecting\n",
+							curr_ip, peers[i].port);
+							FD_CLR(curr_sock, &comm_master);
+							--left_peers;
+							DESTROY(stats[i].mssg);
+							continue;
+						}
+						if (stats[i].mssg_len == 0) {
+							stats[i].mssg_len = 4;
+							stats[i].recv_mssg_len = 0;
+							DESTROY(stats[i].mssg);
+							stats[i].mssg = malloc(4);
+						}
+						if (mssg_received(stats[i])) {
+							stats[i].mssg_len = int_from_bytes(stats[i].mssg);
+							if (stats[i].mssg_len == 0) {
+								verprintf(verbose,
+										"[k] Peer %s:%d sent keep-alive\n",
+										curr_ip, peers[i].port);
+								DESTROY(stats[i].mssg);
+								continue;
+							}
+							stats[i].curr_step = STEP_READID;
+							DESTROY(stats[i].mssg);
+							continue;
+						}
+						int len = stats[i].mssg_len - stats[i].recv_mssg_len;
+
+						res = recv(curr_sock,
+								stats[i].mssg + stats[i].recv_mssg_len,
+								len,
+								MSG_NOSIGNAL);
+						if (res <= 0 && err_is_ignorable()) {
+							continue;
+						}
+						if (res <= 0) {
+							verprintf(
+							verbose,
+							"[e] Could not read length from peer %s:%d: %s\n",
+							curr_ip, peers[i].port,
+							strerror(errno));
+							DESTROY(stats[i].mssg);
+							FD_CLR(curr_sock, &comm_master);
+							--left_peers;
+							continue;
+						}
+						stats[i].recv_mssg_len += res;
+						if (mssg_received(stats[i])) {
+							stats[i].mssg_len = int_from_bytes(stats[i].mssg);
+							if (stats[i].mssg_len == 0) {
+								verprintf(verbose,
+										"[k] Peer %s:%d sent keep-alive\n",
+										curr_ip, peers[i].port);
+								continue;
+							}
+							stats[i].curr_step = STEP_READID;
+							DESTROY(stats[i].mssg);
+							continue;
+						}
+						continue;
+					}
+					// =======================================================
+
+					// ========================= ID ==========================
+					if (stats[i].curr_step == STEP_READID) {
+						DESTROY(stats[i].mssg);
+						unsigned char id;
+						res = recv(curr_sock, &id, 1, MSG_NOSIGNAL);
+						if (res <= 0) {
+							verprintf(
+							verbose,
+							"[e] Could not read id from peer %s:%d %s\n",
+							curr_ip, peers[i].port,
+							strerror(errno));
+							FD_CLR(curr_sock, &comm_master);
+							--left_peers;
+							continue;
+						}
+						stats[i].mssg_len -= 1;     // Read ID
+						stats[i].recv_mssg_len = 0; // Resetting to 0
+						switch (id) {
+							case INTERESTED: {
+								verprintf(
+								verbose,
+								"[?] Got INTERESTED message from peer %s:%d\n",
+								curr_ip, peers[i].port);
+								stats[i].recv_intrstd = 1;
+								if (leeched_len < SIMULBLOCKS)
+									stats[i].curr_step = STEP_UNCHOKE;
+								continue;
+							}
+							case NOT_INTERESTED: {
+								verprintf(verbose,
+										"[?] Got NOT INTERESTED message "
+										"from peer %s:%d\n",
+										curr_ip, peers[i].port);
+								stats[i].recv_intrstd = 0;
+								DESTROY(stats[i].mssg);
+								// Check if this peer is in the leeched list
+								// If so, remove it
+								for (int j = 0; j < leeched_len; ++j) {
+									if (leeched[j] == curr_sock) {
+										leeched[j] = leeched[leeched_len - 1];
+										--leeched_len;
+										break;
+									}
+								}
+								continue;
+							}
+							case REQUEST: {
+								verprintf(
+								verbose,
+								"[?] Got REQUEST message from peer %s\n",
+								curr_ip);
+								if (stats[i].am_choking) {
+									verprintf(
+									verbose,
+									"[e] Peer %s:%d requested piece while "
+									"we are choking him\n",
+									curr_ip, peers[i].port);
+									FD_CLR(curr_sock, &comm_master);
+									--left_peers;
+									DESTROY(stats[i].mssg);
+									continue;
+								}
+								leeched[leeched_len++] = curr_sock;
+								stats[i].curr_step = STEP_READREQ;
+								continue;
+							}
+							case CANCEL: {
+								verprintf(
+								verbose,
+								"[?] Got CANCEL message from peer %s:%d\n",
+								curr_ip, peers[i].port);
+								stats[i].curr_step = STEP_CANCEL;
+								continue;
+							}
+							case HAVEALL: {
+								verprintf(
+								verbose,
+								"[?] Got HAVEALL message from peer %s:%d\n",
+								curr_ip, peers[i].port);
+								stats[i].curr_step = STEP_UNCHOKE;
+								continue;
+							}
+							// fall through
+							case EXTENDED: {
+								verprintf(
+								verbose,
+								"[?] Got EXTENDED message from peer %s:%d\n",
+								curr_ip, peers[i].port);
+								continue;
+							}
+							case HAVE: {
+								if (stats[i].bitfield == NULL) {
+									stats[i].bitfield = calloc(
+									  cl_bitf_len, sizeof(unsigned char));
+									if (stats[i].bitfield == NULL) {
+										verprintf(verbose,
+												  "[e] Could not allocate "
+												  "bitfield for peer %s\n",
+												  curr_ip);
+									}
+								}
+								stats[i].curr_step = STEP_HAVE;
+								continue;
+							}
+							case PIECE: {
+								stats[i].recv_mssg_len = 0;
+								stats[i].curr_step = STEP_DOWNLOAD;
+								continue;
+							}
+							case BITFIELD: {
+								stats[i].curr_step = STEP_BITFIELD;
+								continue;
+							}
+							case UNCHOKE: {
+								verprintf(verbose,
+										"[u] Peer %s:%d unchoked us\n",
+										curr_ip, peers[i].port);
+								continue;
+							}
+							// fall through
+							case CHOKE: {
+								verprintf(
+								verbose, "[o] Peer %s:%d choked us\n",
+								curr_ip, peers[i].port);
+								continue;
+							}
+							// fall through
+							default: {
+								FD_CLR(curr_sock, &comm_master);	
+								--left_peers;
+								continue;
+							}
+						}
+					}
+					// ====================== BITFIELD =======================
+					if (stats[i].curr_step == STEP_BITFIELD) {
+						if (stats[i].mssg_len != cl_bitf_len) {
+							verprintf(verbose,
+									  "[e] Peer %s sent bitfield of invalid "
+									  "length %d\n",
+									  curr_ip,
+									  stats[i].mssg_len);
+							FD_CLR(curr_sock, &comm_master);
+							--left_peers;
+							continue;
+						}
+						if (mssg_received(stats[i])) {
+							verprintf(verbose,
+									  "[b] Read bitfield (%d) from peer %s\n",
+									  stats[i].recv_mssg_len,
+									  curr_ip);
+							stats[i].mssg_len = 0;
+							stats[i].recv_mssg_len = 0;
+							stats[i].has_pcs = 1;
+							continue;
+						}
+						if (stats[i].bitfield == NULL) {
+							stats[i].bitfield = malloc(stats[i].mssg_len);
+							if (stats[i].bitfield == NULL) {
+								verprintf(verbose,
+										  "[x] Could not allocate bitfield "
+										  "for peer %s\n",
+										  curr_ip);
+								FD_CLR(curr_sock, &comm_master);
+								--left_peers;
+								continue;
+							}
+						}
+						int len = stats[i].mssg_len - stats[i].recv_mssg_len;
+						if (len > cl_bitf_len) {
+							printf("bitf");
+							len = 0;
+						}
+						res = recv(curr_sock,
+								   stats[i].bitfield + stats[i].recv_mssg_len,
+								   len,
+								   MSG_NOSIGNAL);
+						if (res <= 0) {
+							verprintf(
+							  verbose,
+							  "[e] Could not read bitfield from peer %s: %s\n",
+							  curr_ip,
+							  strerror(errno));
+							DESTROY(stats[i].bitfield);
+							FD_CLR(curr_sock, &comm_master);
+							--left_peers;
+							continue;
+						}
+						stats[i].recv_mssg_len += res;
+						if (mssg_received(stats[i])) {
+							verprintf(verbose,
+									  "[b] Read bitfield (%d) from peer %s\n",
+									  stats[i].recv_mssg_len,
+									  curr_ip);
+							stats[i].mssg_len = 0;
+							stats[i].recv_mssg_len = 0;
+							stats[i].has_pcs = 1;
+							continue;
+						}
+						continue;
+					}
+					// =======================================================
+
+					// ======================== HAVE =========================
+					if (stats[i].curr_step == STEP_HAVE) {
+						int have_len = stats[i].mssg_len;
+						if (have_len != 4) {
+							verprintf(
+							  verbose,
+							  "[e] Peer %s sent HAVE of invalid length %d\n",
+							  curr_ip,
+							  have_len);
+							FD_CLR(curr_sock, &comm_master);
+							--left_peers;
+							continue;
+						}
+						unsigned char index[have_len];
+						uint32_t piece_index = -1;
+						res = recv(curr_sock, index, have_len, MSG_NOSIGNAL);
+						if (res < 4) {
+							verprintf(verbose,
+									  "[e] Could not read HAVE from peer %s\n",
+									  curr_ip);
+							FD_CLR(curr_sock, &comm_master);
+							--left_peers;
+							continue;
+						} else {
+							piece_index = int_from_bytes(index);
+							set_piece(stats[i].bitfield, piece_index);
+							if (has_piece(stats[i].bitfield, piece_index)) {
+								verprintf(verbose,
+										  "[v] Peer %s HAVE piece %d\n",
+										  curr_ip,
+										  piece_index);
+							} else {
+								verprintf(
+								  verbose,
+								  "[e] Could not set HAVE for peer %s\n",
+								  curr_ip);
+							}
+						}
+						reset_peer_step(&stats[i]);
+						stats[i].has_pcs = 1;
+						continue;
+					}
+
+					// ================== DOWNLOAD BLOCKS ====================
+					if (stats[i].curr_step == STEP_DOWNLOAD) {
+						if (mssg_received(stats[i])) {
+							int blck_idx = stats[i].curr_blck_off / BLOCKLEN;
+							verprintf(verbose,
+									  "[b] Read piece %d and block %d (%d) "
+									  "from peer %s\n",
+									  curr_pc_idx,
+									  blck_idx,
+									  stats[i].recv_mssg_len,
+									  curr_ip);
+
+							DESTROY(stats[i].mssg);
+							stats[i].curr_blck_off = -1;
+							reset_peer_step(&stats[i]);
+							--stats[i].curr_reqs;
+							break;
+						}
+						if (stats[i].recv_mssg_len == 0 &&
+							stats[i].curr_blck_off < 0) {
+							unsigned char piece_index_buff[4];
+							unsigned char block_offset_buff[4];
+							res = recv(
+							  curr_sock, piece_index_buff, 4, MSG_NOSIGNAL);
+							if (res <= 0 && err_is_ignorable()) {
+								continue;
+							}
+							if (res < 4) {
+								verprintf(verbose,
+										  "[e] Could not read piece index "
+										  "from peer %s: %s\n",
+										  curr_ip,
+										  strerror(errno));
+								FD_CLR(curr_sock, &comm_master);
+								--left_peers;
+								DESTROY(stats[i].mssg);
+								continue;
+							}
+							int piece_index = int_from_bytes(piece_index_buff);
+							// If got a wrong piece index reset the piece this
+							// peer was downloading
+							if (piece_index != curr_pc_idx) {
+								verprintf(verbose,
+										  "[e] Wrong piece index %d (req: %d) "
+										  "on peer %s\n",
+										  piece_index,
+										  curr_pc_idx,
+										  curr_ip);
+								DESTROY(stats[i].mssg);
+								FD_CLR(curr_sock, &comm_master);
+								--left_peers;
+								continue;
+							}
+							res = recv(
+							  curr_sock, block_offset_buff, 4, MSG_NOSIGNAL);
+							if (res <= 0 && err_is_ignorable()) {
+								continue;
+							}
+							if (res < 4) {
+								verprintf(
+								  verbose,
+								  "[e] Could not read block offset from peer "
+								  "%s: %s (Piece %d, Block %lld)\n",
+								  curr_ip,
+								  strerror(errno),
+								  curr_pc_idx,
+								  stats[i].curr_blck_off);
+								FD_CLR(curr_sock, &comm_master);
+								--left_peers;
+								DESTROY(stats[i].mssg);
+								continue;
+							}
+							stats[i].curr_blck_off =
+							  int_from_bytes(block_offset_buff);
+							stats[i].mssg_len -= 8; // Read 8 bytes already
+							DESTROY(stats[i].mssg);
+							stats[i].mssg = malloc(stats[i].mssg_len);
+							if (stats[i].mssg == NULL) {
+								verprintf(
+								  verbose,
+								  "[x] Could not allocate block for peer %s\n",
+								  curr_ip);
+								FD_CLR(curr_sock, &comm_master);
+								--left_peers;
+								continue;
+							}
+						}
+						int len = stats[i].mssg_len - stats[i].recv_mssg_len;
+						res = recv(curr_sock,
+								   stats[i].mssg + stats[i].recv_mssg_len,
+								   len,
+								   MSG_NOSIGNAL);
+						if (res <= 0 && err_is_ignorable()) {
+							continue;
+						}
+						if (res <= 0) {
+							verprintf(
+							  verbose,
+							  "[e] Could not read block from peer %s: %s\n",
+							  curr_ip,
+							  strerror(errno));
+							int blck_idx = stats[i].curr_blck_off / BLOCKLEN;
+							FD_CLR(curr_sock, &comm_master);
+							--left_peers;
+							continue;
+						}
+						stats[i].recv_mssg_len += res;
+						if (mssg_received(stats[i])) {
+							int blck_idx = stats[i].curr_blck_off / BLOCKLEN;
+							verprintf(verbose,
+									  "[b] Read piece %d and block %d (%d) "
+									  "from peer %s\n",
+									  curr_pc_idx,
+									  blck_idx,
+									  stats[i].recv_mssg_len,
+									  curr_ip);
+
+							DESTROY(stats[i].mssg);
+
+							stats[i].curr_blck_off = -1;
+							reset_peer_step(&stats[i]);
+							--stats[i].curr_reqs;
+							break;
+						}
+					}
+					// =======================================================
+				}
+			}
+		}
+
+		// =================== SEND MESSAGES =====================
+		for (int i = 0; i < conn_peers; i++) {
+			char* curr_ip = stats[i].ip;
+			int curr_sock = conn_socks[i];
+			if (conn_socks[i] == -1 || conn_socks[i] == listen_sock)
+				continue;
+			// =================== SEND BITFIELD =====================
+			if (stats[i].curr_step == STEP_SNDBTFLD) {
+				// Bitfield message:
+				// 4 byte: length prefix
+				// 1 byte: message id
+				// x byte: bitfield
+				unsigned char btfld_msg[cl_bitf_len + 5];
+				// Set length prefix
+				int_to_bytes(btfld_msg, cl_bitf_len + 1);
+				// Set message id	
+				btfld_msg[4] = 5;
+				// Create finished bitfield, and set it in the message
+				unsigned char* btfld = &btfld_msg[5];
+				memset(btfld, 255, cl_bitf_len);
+				// Set the last byte of the bitfield
+				int last_byte = cl_bitf_len - 1;
+				int last_byte_bits = num_blcks % 8;
+				if (last_byte_bits == 0) {
+					last_byte_bits = 8;
+				}
+				btfld[last_byte] = 0;
+				for (int j = 0; j < last_byte_bits; ++j) {
+					btfld[last_byte] |= 1 << (7 - j);
+				}
+				// Send the bitfield message
+				int btfld_len = cl_bitf_len + 5;
+				res = send_all(curr_sock, btfld_msg, &btfld_len);
+				if (res < 0) {
+					verprintf(
+					verbose,
+					"[e] Error on peer %s:%d: %s (sndbtfld)\n",
+					curr_ip, peers[i].port,
+					strerror(errno));
+					conn_socks[i] = -1;
+					FD_CLR(curr_sock, &comm_master);
+					--left_peers;
+				} else {
+					verprintf(verbose,
+							"[v] Sent bitfield to peer %s:%d\n",
+							curr_ip, peers[i].port);
+					reset_peer_step(&stats[i]);
+					DESTROY(stats[i].mssg);
+				}
+			}
+			// =================== SEND NOT INTERESTED =====================
+			if (stats[i].curr_step == STEP_NOTINTERESTED) {
+				// Not interested message:
+				// 4 byte: length prefix
+				// 1 byte: message id
+				unsigned char notint_msg[5];
+				// Set length prefix
+				int_to_bytes(notint_msg, 1);
+				// Set message id
+				notint_msg[4] = NOT_INTERESTED;
+				// Send the not interested message
+				int notint_len = 5;
+				res = send_all(curr_sock, notint_msg, &notint_len);
+				if (res < 0) {
+					verprintf(
+					verbose,
+					"[e] Error on peer %s:%d: %s (sndnotint)\n",
+					curr_ip, peers[i].port,
+					strerror(errno));
+					conn_socks[i] = -1;
+					FD_CLR(curr_sock, &comm_master);
+					--left_peers;
+				} else {
+					verprintf(verbose,
+							"[v] Sent not interested to peer %s:%d\n",
+							curr_ip, peers[i].port);
+					reset_peer_step(&stats[i]);
+					DESTROY(stats[i].mssg);
+				}
+			}
+			// =================== EXTENDED =====================
+			if (stats[i].curr_step == STEP_EXT) {
+				// Extended message:
+				// 4 byte: length prefix
+				// 1 byte: message id
+				// x byte: extended message
+				unsigned char ext_msg[ext_hndshk_len + 5];
+				// Set length prefix
+				int_to_bytes(ext_msg, ext_hndshk_len + 1);
+				// Set message id
+				ext_msg[4] = EXTENDED;
+				// Set extended message
+				unsigned char* ext = &ext_msg[5];
+				memcpy(ext, ext_hndshk_str, ext_hndshk_len);
+				// Send the extended message
+				int ext_len = ext_hndshk_len + 5;
+				res = send_all(curr_sock, ext_msg, &ext_len);
+				if (res < 0) {
+					verprintf(
+					verbose,
+					"[e] Error on peer %s:%d: %s (sndext)\n",
+					curr_ip, peers[i].port,
+					strerror(errno));
+					conn_socks[i] = -1;
+					FD_CLR(curr_sock, &comm_master);
+					--left_peers;
+				} else {
+					verprintf(verbose,
+							"[v] Sent extended message to peer %s:%d\n",
+							curr_ip, peers[i].port);
+					reset_peer_step(&stats[i]);
+					stats[i].curr_step = STEP_HAVEALL;
+					DESTROY(stats[i].mssg);
+				}
+			}
+			// =================== SEND HAVEALL =====================
+			if (stats[i].curr_step == STEP_HAVEALL) {
+				// Have all message:
+				// 4 byte: length prefix: 0001
+				// 1 byte: message id: 14
+				unsigned char haveall_msg[5] = {0, 0, 0, 1, HAVEALL};
+				int haveall_len = 5;
+				res = send_all(curr_sock, haveall_msg, &haveall_len);
+				if (res < 0) {
+					verprintf(
+					verbose,
+					"[e] Error on peer %s:%d: %s (sndhaveall)\n",
+					curr_ip, peers[i].port,
+					strerror(errno));
+					conn_socks[i] = -1;
+					FD_CLR(curr_sock, &comm_master);
+					--left_peers;
+				} else {
+					verprintf(verbose,
+							"[v] Sent HAVEALL to peer %s:%d\n",
+							curr_ip, peers[i].port);
+					reset_peer_step(&stats[i]);
+					DESTROY(stats[i].mssg);
+				}
+			}
+			// =================== UNCHOKE PEER ======================
+			if (stats[i].curr_step == STEP_UNCHOKE) {
+				verprintf(verbose, "[u] Unchoking peer %s:%d\n", curr_ip, peers[i].port);
+				stats[i].am_choking = 0;
+				unsigned char unchoke[] = {0, 0, 0, 1, UNCHOKE};
+				int unchokelen = 5;
+				res = send_all(curr_sock, unchoke, &unchokelen);
+				if (res < 0) {
+					verprintf(
+					verbose,
+					"[e] Could not send unchoke to peer %s:%d: %s\n",
+					curr_ip, peers[i].port,
+					strerror(errno));
+					FD_CLR(curr_sock, &comm_master);
+					--left_peers;
+				} else {
+					reset_peer_step(&stats[i]);
+					DESTROY(stats[i].mssg);
+				}
+			}
+
+			// =================== CHOKE PEER ========================
+			if (stats[i].curr_step == STEP_CHOKE) {
+				verprintf(verbose, "[u] Choking peer %s:%d\n", curr_ip, peers[i].port);
+				stats[i].am_choking = 1;
+				unsigned char choke[] = {0, 0, 0, 1, CHOKE};
+				int chokelen = 5;
+				res = send_all(curr_sock, choke, &chokelen);
+				if (res < 0) {
+					verprintf(
+					verbose,
+					"[e] Could not send choke to peer %s:%d: %s\n",
+					curr_ip, peers[i].port,
+					strerror(errno));
+					FD_CLR(curr_sock, &comm_master);
+					--left_peers;
+				} else {
+					reset_peer_step(&stats[i]);
+					DESTROY(stats[i].mssg);
+				}
+			}
+
+			// =================== READ REQUEST ======================
+			if (stats[i].curr_step == STEP_READREQ) {
+				verprintf(
+				verbose,
+				"[?] Reading request from peer %s:%d\n",
+				curr_ip, peers[i].port);
+				
+				if (stats[i].mssg == NULL) {
+					stats[i].mssg = malloc(13);
+					stats[i].mssg_len = 13;
+					stats[i].recv_mssg_len = 0;
+					if (stats[i].mssg == NULL) {
+						verprintf(
+						verbose,
+						"[e] Could not allocate memory for request "
+						"from peer %s:%d\n",
+						curr_ip, peers[i].port);
+						FD_CLR(curr_sock, &comm_master);
+						--left_peers;
+						continue;
+					}
+				}
+				res = recv(curr_sock,
+						stats[i].mssg + stats[i].recv_mssg_len,
+						12,
+						MSG_NOSIGNAL);
+
+				if (res <= 0) {
+					verprintf(
+					verbose,
+					"[e] Could not read request from peer %s:%d: %s\n",
+					curr_ip, peers[i].port,
+					strerror(errno));
+					FD_CLR(curr_sock, &comm_master);
+					--left_peers;
+					continue;
+				}
+				stats[i].recv_mssg_len += res;
+				
+				int index = int_from_bytes(stats[i].mssg);
+				int begin = int_from_bytes(stats[i].mssg + 4);
+				int length = int_from_bytes(stats[i].mssg + 8);
+				if (index >= num_pcs) {
+					verprintf(
+					verbose,
+					"[e] Peer %s:%d requested piece %d, but we only "
+					"have %d pieces\n",
+					curr_ip, peers[i].port,
+					index,
+					num_pcs);
+					FD_CLR(curr_sock, &comm_master);
+					--left_peers;
+					continue;
+				}
+				if (length > PIECELEN) {
+					verprintf(
+					verbose,
+					"[e] Peer %s:%d requested piece %d, offset %d, "
+					"length %d, but we only have %d bytes per "
+					"piece\n",
+					curr_ip, peers[i].port,
+					index,
+					begin,
+					length,
+					PIECELEN);
+					FD_CLR(curr_sock, &comm_master);
+					--left_peers;
+					continue;
+				}
+				if (begin + length > PIECELEN) {
+					verprintf(
+					verbose,
+					"[e] Peer %s:%d requested piece %d, offset %d, "
+					"length %d, but it exceeds the piece length "
+					"of %d bytes\n",
+					curr_ip, peers[i].port,
+					index,
+					begin,
+					length,
+					PIECELEN);
+					FD_CLR(curr_sock, &comm_master);
+					--left_peers;
+					continue;
+				}
+				if (stats[i].req_len == MAXREQS) {
+					verprintf(
+					verbose,
+					"[e] Peer %s:%d requested piece %d, offset %d, "
+					"length %d, but we already have %d requests "
+					"from it\n",
+					curr_ip, peers[i].port,
+					index,
+					begin,
+					length,
+					MAXREQS);
+					FD_CLR(curr_sock, &comm_master);
+					--left_peers;
+					continue;
+				}
+				if (stats[i].req == NULL) {
+					stats[i].req = malloc(sizeof(peer_req) * MAXREQS);
+					if (stats[i].req == NULL) {
+						verprintf(
+						verbose,
+						"[e] Could not allocate memory for request "
+						"from peer %s:%d\n",
+						curr_ip, peers[i].port);
+						FD_CLR(curr_sock, &comm_master);
+						--left_peers;
+						continue;
+					}
+					for (int j = 0; j < MAXREQS; ++j) {
+						stats[i].req[j].index = -1;
+						stats[i].req[j].begin = -1;
+						stats[i].req[j].length = -1;
+					}
+				}
+				verprintf(
+				verbose,
+				"[?] Requested piece %d, offset %d, length %d\n",
+				index,
+				begin,
+				length);
+				// Add the request to empty slot
+				for (int j = 0; j < MAXREQS; ++j) {
+					if (stats[i].req[j].index == -1) {
+						stats[i].req[j].index = index;
+						stats[i].req[j].begin = begin;
+						stats[i].req[j].length = length;
+						++stats[i].req_len;
+						break;
+					}
+				}
+				reset_peer_step(&stats[i]);
+				DESTROY(stats[i].mssg);
+			}
+
+			// =================== CANCEL REQUESTS ======================
+			if (stats[i].curr_step == STEP_CANCEL) {
+				if (stats[i].mssg == NULL) {
+					stats[i].mssg = malloc(13);
+					stats[i].mssg_len = 13;
+					stats[i].recv_mssg_len = 0;
+					if (stats[i].mssg == NULL) {
+						verprintf(
+						verbose,
+						"[e] Could not allocate memory for request "
+						"from peer %s:%d\n",
+						curr_ip, peers[i].port);
+						FD_CLR(curr_sock, &comm_master);
+						--left_peers;
+						continue;
+					}
+				}
+				res = recv(curr_sock,
+						stats[i].mssg + stats[i].recv_mssg_len,
+						12,
+						MSG_NOSIGNAL);
+
+				if (res <= 0) {
+					verprintf(
+					verbose,
+					"[e] Could not read request from peer %s:%d: %s\n",
+					curr_ip, peers[i].port,
+					strerror(errno));
+					FD_CLR(curr_sock, &comm_master);
+					--left_peers;
+					continue;
+				}
+				stats[i].recv_mssg_len += res;
+				
+				int index = int_from_bytes(stats[i].mssg);
+				int begin = int_from_bytes(stats[i].mssg + 4);
+				int length = int_from_bytes(stats[i].mssg + 8);
+				
+				for (int j = 0; j < MAXREQS; ++j) {
+					if (stats[i].req[j].index == index &&
+						stats[i].req[j].begin == begin &&
+						stats[i].req[j].length == length) {
+						stats[i].req[j].index = -1;
+						stats[i].req[j].begin = -1;
+						stats[i].req[j].length = -1;
+						--stats[i].req_len;
+						break;
+					}
+				}
+				verprintf(
+				verbose,
+				"[?] Cancelled request for piece %d, offset %d, "
+				"length %d\n", index, begin, length);
+				reset_peer_step(&stats[i]);
+				DESTROY(stats[i].mssg);
+			}
+		}
+
+		// =================== LEECH PIECES ======================
+		for (int i = 0; i < leeched_len; ++i) {
+			int curr_sock = leeched[i];
+			int curr_peer = -1;
+			for (int j = 0; j < conn_peers; ++j) {
+				if (conn_socks[j] == curr_sock) {
+					curr_peer = j;
+					break;
+				}
+			}
+			if (curr_peer == -1) {
+				verprintf(verbose, "[e] Could not find peer for socket %d\n", curr_sock);
+				FD_CLR(curr_sock, &comm_master);
+				--left_peers;
+				leeched[i] = leeched[--leeched_len];
+				--i;
+				continue;
+			}
+			char *curr_ip = stats[curr_peer].ip;
+			// Start by checking if we have any requests from this peer
+			if (stats[curr_peer].req_len == 0) {
+				verprintf(verbose, "[?] No requests from peer %s:%d\n", curr_ip, peers[curr_peer].port);
+				// Replace this socket with the last one in the array
+				leeched[i] = leeched[--leeched_len];
+				--i;
+				continue;
+			}
+			// Check if we have any pieces to send
+			int curr_req = -1;
+			for (int j = 0; j < MAXREQS; ++j) {
+				if (stats[curr_peer].req[j].index == -1) {
+					continue;
+				}
+				curr_req = j;
+				break;
+			}
+			if (curr_req == -1) {
+				verprintf(verbose, "[?] No pieces to send to peer %s:%d\n",
+				curr_ip, peers[curr_peer].port);
+				// Replace this socket with the last one in the array
+				leeched[i] = leeched[--leeched_len];
+				--i;
+				// Send a keep-alive message
+				verprintf(verbose, "[?] Sending keep-alive to peer %s:%d\n",
+				curr_ip, peers[curr_peer].port);
+				unsigned char *keep_alive = (char *)malloc(4);
+				int_to_bytes(keep_alive, 0);
+				if (send(curr_sock, keep_alive, 4, 0) == -1) {
+					verprintf(verbose, "[e] Could not send keep-alive to peer %s:%d\n",
+					curr_ip, peers[curr_peer].port);
+					FD_CLR(curr_sock, &comm_master);
+					--left_peers;
+					continue;
+				}
+				continue;
+			}
+			// Send the piece
+			int index = stats[curr_peer].req[curr_req].index;
+			int begin = stats[curr_peer].req[curr_req].begin;
+			int length = stats[curr_peer].req[curr_req].length;
+			verprintf(
+			verbose,
+			"[?] Sending piece %d, offset %d, length %d to peer %s:%d\n",
+			index,
+			begin,
+			length,
+			curr_ip, peers[curr_peer].port);
+			char *piece = malloc(length);
+			if (piece == NULL) {
+				verprintf(verbose, "[e] Could not allocate memory for piece\n");
+				FD_CLR(curr_sock, &comm_master);
+				--left_peers;
+				continue;
+			}
+			// Read the piece from the file
+			fseek(fp, index * PIECELEN + begin, SEEK_SET);
+			fread(piece, 1, length, fp);
+			// Send the piece
+			unsigned char *mssg = malloc(13 + length);
+			if (mssg == NULL) {
+				verprintf(verbose, "[e] Could not allocate memory for piece mssg\n");
+				FD_CLR(curr_sock, &comm_master);
+				--left_peers;
+				continue;
+			}
+			// Piece mssg format: <len=0009 + X><id=7><index><begin><piece>
+			int mssg_len = 9 + length;
+			int_to_bytes(mssg, mssg_len);
+			mssg[4] = 7;
+			int_to_bytes(mssg + 5, index);
+			int_to_bytes(mssg + 9, begin);
+			memcpy(mssg + 13, piece, length);
+			free(piece);
+			mssg_len += 4;
+			res = send_all(curr_sock, mssg, &mssg_len);
+			if (res < 0) {
+				verprintf(verbose, "[e] Could not send piece to peer %s:%d\n",
+				curr_ip, peers[curr_peer].port);
+				FD_CLR(curr_sock, &comm_master);
+				--left_peers;
+				leeched[i] = leeched[--leeched_len];
+				--i;
+				continue;
+			}
+			// Delete the request
+			stats[curr_peer].req[curr_req].index = -1;
+			stats[curr_peer].req[curr_req].begin = -1;
+			stats[curr_peer].req[curr_req].length = -1;
+			--stats[curr_peer].req_len;
+			DESTROY(stats[curr_peer].mssg);
+			DESTROY(mssg);
+		}	
+	}
+	if (left_peers == 0) {
+		verprintf(verbose, "[i] No more peers left to communicate with \n");
+	}
+	cleanup(stats, conn_peers, NULL, 0, sockets, total_peers, fp);
 	return 0;
 }
-
-// int seed(int port, int num_pcs, int num_blcks, int blck_len,
-// 		 char* file_name) {
-// 	// ------------------------- INITIALIZATION -------------------------
-// 	int listen_sock = socket(AF_INET, SOCK_STREAM, 0);
-// 	if (listen_sock < 0) {
-// 		printf("[e] Could not create socket\n");
-// 		return -1;
-// 	}
-// 	struct sockaddr_in serv_addr;
-// 	serv_addr.sin_family = AF_INET;
-// 	serv_addr.sin_addr.s_addr = INADDR_ANY;
-// 	serv_addr.sin_port = htons(port);
-// 	if (bind(listen_sock, (struct sockaddr*)&serv_addr, sizeof(serv_addr)) <
-// 		0) {
-// 		printf("[e] Could not bind socket\n");
-// 		return -1;
-// 	}
-// 	if (listen(listen_sock, 5) < 0) {
-// 		printf("[e] Could not listen on socket\n");
-// 		return -1;
-// 	}
-// 	// ------------------------------------------------------------------
-
-// 	// ------------------------- FILE HANDLING --------------------------
-// 	FILE* fp = fopen(file_name, "rb");
-// 	if (fp == NULL) {
-// 		printf("[e] Could not open file %s\n", file_name);
-// 		return -1;
-// 	}
-// 	fseek(fp, 0, SEEK_END);
-// 	int file_len = ftell(fp);
-// 	fseek(fp, 0, SEEK_SET);
-// 	// ------------------------------------------------------------------
-
-// 	// ------------------------- PEER HANDLING --------------------------
-// 	int total_peers = 0;
-// 	int* sockets = malloc(sizeof(int) * HANDLECOUNT);
-// 	// ------------------------------------------------------------------
-
-// 	// ------------------------- COMMUNICATION --------------------------
-// 	fd_set comm_master;
-// 	fd_set comm_read;
-// 	FD_ZERO(&comm_master);
-// 	FD_ZERO(&comm_read);
-// 	FD_SET(listen_sock, &comm_master);
-// 	int max_fd = listen_sock;
-// 	// ------------------------------------------------------------------
-
-// // 	// ------------------------- MAIN LOOP ------------------------------
-// 	while (1) {
-// 		comm_read = comm_master;
-// 		int res = select(max_fd + 1, &comm_read, NULL, NULL, NULL);
-// 		if (res < 0) {
-// 			printf("[e] Could not select\n");
-// 			return -1;
-// 		}
-// 		for (int i = 0; i <= max_fd; i++) {
-// 			if (!FD_ISSET(i, &comm_read)) {
-// 				continue;
-// 			}
-// 			if (i == listen_sock) {
-// 				// ------------------------- ACCEPT -------------------------
-// 				struct sockaddr_in cli_addr;
-// 				socklen_t cli_len = sizeof(cli_addr);
-// 				int new_sock = accept(listen_sock, (struct sockaddr*)&cli_addr,
-// 									  &cli_len);
-// 				if (new_sock < 0) {
-// 					printf("[e] Could not accept connection\n");
-// 					return -1;
-// 				}
-// 				FD_SET(new_sock, &comm_master);
-// 				if (new_sock > max_fd) {
-// 					max_fd = new_sock;
-// 				}
-// 				// ----------------------------------------------------------
-// 			} else {
-// 				// ------------------------- RECEIVE ------------------------
-// 				int curr_sock = i;
-// 				char* curr_ip = get_ip(curr_sock);
-// 				int curr_port = get_port(curr_sock);
-// 				printf(verbose, "[r] Received message from peer %s\n",
-						//   curr_ip);
-				// char* msg = malloc(sizeof(char) * MSGLEN);
-				// int msg_len = recv(curr_sock, msg, MSGLEN, 0);
-				// if (msg_len < 0) {
-				// 	printf("[e] Could not receive message\n");
-				// 	return -1;
-				// }
-				// if (msg_len == 0) {
-				// 	printf(verbose, "[r] Peer %s disconnected\n", curr_ip);
-				// 	FD_CLR(curr_sock, &comm_master);
-				// 	--total_peers;
-				// } else {
-				// 	// ------------------------- HANDSHAKE ------------------------
-				// 	if (msg[0] == 'H') {
-				// 		printf(verbose, "[r] Received handshake from peer %s\n",
-				// 				  curr_ip);
-				// 		// ------------------------- ACCEPT -------------------------
-				// 		if (total_peers < HANDLECOUNT) {
-				// 			printf(verbose, "[r] Accepted handshake from peer %s\n",
-				// 					  curr_ip);
-				// 			sockets[total_peers] = curr_sock;
-				// 			++total_peers;
-				// 			char* resp = malloc(sizeof(char) * MSGLEN);
-				// 			resp[0] = 'A';
-				// 			resp[1] = '\0';
-				// 			int resp_len = send(curr_sock, resp, MSGLEN, 0);
-				// 			if (resp_len < 0) {
-				// 				printf("[e] Could not send response\n");
-				// 				return -1;
-				// 			}
-				// 			free(resp);
-				// 		}
-				// 		// ----------------------------------------------------------
-				// 		// ------------------------- REJECT -------------------------
-				// 		else {
-				// 			printf(verbose, "[r] Rejected handshake from peer %s\n",
-				// 					  curr_ip);
-				// 			char* resp = malloc(sizeof(char) * MSGLEN);
-				// 			resp[0] = 'R';
-				// 			resp[1] = '\0';
-				// 			int resp_len = send(curr_sock, resp, MSGLEN, 0);
-				// 			if (resp_len < 0) {
-				// 				printf("[e] Could not send response\n");
-				// 				return -1;
-				// 			}
-				// 			free(resp);
-				// 		}
-				// 		// ----------------------------------------------------------
-				// 	}
-				// }
-				// free(msg);
-				// // ----------------------------------------------------------
-	// 		}
-	// 	}
-	// }
-// 	// ------------------------------------------------------------------
-
-	// ------------------------- CLEANUP -------------------------------
-// 	free(sockets);
-// 	fclose(fp);
-// 	// ------------------------------------------------------------------
-
-// 	return 0;
-// }

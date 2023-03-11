@@ -1,6 +1,6 @@
 CC = gcc
 CFLAGS = -Wall -Wextra
-LIBS = -lssl -lcrypto -lcurl -lm
+LIBS = -lssl -lcrypto -lcurl -lminiupnpc -I/usr/local/include/miniupnpc -L/usr/local/lib
 
 SDIR = ./src
 _SOURCE = main.c p2p.c bencode.c dict.c
@@ -12,10 +12,14 @@ DEPS = $(addprefix $(IDIR)/, $(_DEPS))
 
 .PHONY: all clean
 
-all: bittorrent
+all: c_bittorrent
 
-bittorrent: $(SOURCE) $(DEPS)
+# Compile 'debug' for gdb debugging
+debug: CFLAGS += -g
+debug: all
+
+c_bittorrent: $(SOURCE) $(DEPS)
 	$(CC) $(CFLAGS) -I$(IDIR) $(SOURCE) -o $@ $(LIBS)
 
 clean:
-	rm -f bittorrent
+	rm -f c_bittorrent
