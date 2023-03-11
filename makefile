@@ -1,6 +1,6 @@
 CC = gcc
 CFLAGS = -Wall -Wextra
-LIBS = -lssl -lcrypto -lcurl -lminiupnpc -I/usr/local/include/miniupnpc -L/usr/local/lib
+LIBS = -lssl -lcrypto -lcurl
 
 SDIR = ./src
 _SOURCE = main.c p2p.c bencode.c dict.c
