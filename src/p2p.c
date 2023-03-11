@@ -16,8 +16,6 @@
 
 #include "bencode.h"
 #include "p2p.h"
-#include <miniupnpc/miniupnpc.h>
-#include <miniupnpc/upnpcommands.h>
 
 static int
 write_data(void* content, int size, int nmemb, be_string* response)
@@ -551,39 +549,6 @@ int seed(int port, int verbose, char* file_name, char* torrent_file) {
 	}
 
 	char ip[16];
-
-	// UPnP port forwarding
-	int error = 0;
-	struct UPNPDev* devlist = upnpDiscover(2000, NULL, NULL, 0, 0, 2, &error);
-	if (devlist == NULL) {
-		printf("UPnP device not found\n");
-	} else {
-		struct UPNPUrls urls;
-		struct IGDdatas data;
-		int status = UPNP_GetValidIGD(devlist, &urls, &data, ip, sizeof(ip));
-		if (status == 1) {
-			char port_str[6];
-			snprintf(port_str, 6, "%d", port);
-			int r = UPNP_AddPortMapping(urls.controlURL,
-										data.first.servicetype,
-										port_str,
-										port_str,
-										ip,
-										"BitTorrent",
-										"TCP",
-										NULL,
-										"0");
-			if (r != UPNPCOMMAND_SUCCESS) {
-				printf("UPnP port forwarding failed\n");
-			} else {
-				printf("UPnP port forwarding successful\n");
-			}
-			freeUPNPDevlist(devlist);
-			FreeUPNPUrls(&urls);
-		} else {
-			printf("UPnP device not found\n");
-		}
-	}
 
 	// Get local IP address
 	get_external_ip(ip);
