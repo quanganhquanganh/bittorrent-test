@@ -60,6 +60,6 @@ main(int argc, char **argv)
 	// strcat(torrent, ".torrent");
 
 	// return generate_torrent(file, name, torrent);
-	return seed(6889, 1, "/home/quanganh/Documents/robotslide.pptx", "/home/quanganh/Documents/robotslide4.torrent");
+	return seed(6889, 1, "./robotslide.pptx", "./robotslide3.torrent");
 	// return seed(6889, 1, "debian-11.5.0-amd64-netinst.iso", "debian-11.5.0-amd64-netinst.iso.torrent")
 }
