@@ -1,65 +1,48 @@
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-
 #include <time.h>
 #include <unistd.h>
 
 #include "p2p.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
-const char *info =
-"c_bittorrent - an experimental bare-bones bittorrent client";
-const char *usage =
-"Usage: c_bittorrent TORRENTFILE [FILENAME] [OPTION]\n"
-"\n"
-"-v --verbose    explain what is being done\n"
-"-h --help       print this help message and exit";
+#define DEFAULT_PORT 6889
 
-int
-main(int argc, char **argv)
-{
-	srand(time(NULL) * getpid());
+int main(int argc, char *argv[]) {
+    int verbose = 0;
+    int result = 0;
 
-	// int verbose = 0;
-	// char *file = NULL;
-	// char *name = NULL;
-	// char torrent[256];
+    if (argc < 3) {
+        fprintf(stderr, "Usage: %s [-l|-s] [<torrent_file_location>|<file_location>]\n", argv[0]);
+        return 1;
+    }
 
-	// // Start from 1 because first argument is program name
-	// for(int i = 1; i < argc; i++) {
-	// 	if(strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--verbose") == 0) {
-	// 		verbose = 1;
-	// 		continue;
-	// 	}
-	// 	if(strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
-	// 		printf("%s\n", info);
-	// 		printf("%s\n", usage);
-	// 		return 0;
-	// 	}
+    if (strcmp(argv[1], "-l") == 0) {
+        char name[256];
+        result = leech(argv[2], name, verbose);
+        if (result == 0) {
+            result = seed(DEFAULT_PORT, verbose, name, argv[2]);
+        }
+    }
+    else if (strcmp(argv[1], "-s") == 0) {
+        if (argc < 3) {
+            fprintf(stderr, "Usage: %s -s <file_location>\n", argv[0]);
+            return 1;
+        }
+        char *name = strrchr(argv[2], '/');
+        name = (name == NULL) ? argv[2] : name + 1;
+        char *output = malloc(strlen(name) + 9);
+        sprintf(output, "%s.torrent", name);
+        result = generate_torrent(argv[2], name, output);
+        if (result == 0) {
+            result = seed(DEFAULT_PORT, verbose, argv[2], output);
+        }
+        free(output);
+    }
+    else {
+        fprintf(stderr, "Unknown command: %s\n", argv[1]);
+        return 1;
+    }
 
-	// 	if(argv[i][0] == '-') {
-	// 		printf("Invalid argument '%s'\n", argv[i]);
-	// 		printf("%s\n", usage);
-	// 		return 1;
-	// 	}
-
-	// 	if(file == NULL) {
-	// 		file = argv[i];
-	// 	} else if(name == NULL) {
-	// 		name = argv[i];
-	// 	}
-	// }
-
-	// if(file == NULL) {
-	// 	printf("No torrent file specified\n");
-	// 	printf("%s\n", usage);
-	// 	return 1;
-	// }
-
-	// strcat(torrent, name);
-	// strcat(torrent, ".torrent");
-
-	// return generate_torrent(file, name, torrent);
-	return seed(6889, 1, "./robotslide.pptx", "./robotslide3.torrent");
-	// return seed(6889, 1, "debian-11.5.0-amd64-netinst.iso", "debian-11.5.0-amd64-netinst.iso.torrent")
+    return result;
 }

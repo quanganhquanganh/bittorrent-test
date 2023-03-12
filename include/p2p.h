@@ -123,7 +123,7 @@ typedef struct peer_status
 
 int generate_torrent(const char *file, const char *name, const char *output);
 
-int p2p_start(const char *file, const char *name, int verbose);
+int leech(const char *file, char *name, int verbose);
 
 int seed(int port, int verbose, char* file_name, char* torrent_file);
 

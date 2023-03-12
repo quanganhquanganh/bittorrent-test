@@ -1,6 +1,6 @@
 CC = gcc
 CFLAGS = -Wall -Wextra
-LIBS = -lssl -lcrypto -lcurl
+LIBS = -lssl -lcrypto -lcurl -lm
 
 SDIR = ./src
 _SOURCE = main.c p2p.c bencode.c dict.c
